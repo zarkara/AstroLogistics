@@ -1,6 +1,6 @@
 # AstroLogistics — Design
 
-Status: draft v0.4 · Language: Python 3.11+ · Propagator: [`sgp4`](https://pypi.org/project/sgp4/) (≥ 2.23)
+Status: draft v0.5 · Language: Python 3.11+ · Propagator: [`sgp4`](https://pypi.org/project/sgp4/) (≥ 2.23)
 
 ## 1. Purpose
 
@@ -33,7 +33,7 @@ irregularly. Ranking and assignment build on that.
 | In scope (v0.3) | Out of scope for now |
 |---|---|
 | Catalog of orbital objects (robots, passive objects, parking orbits) with element-set history | Raw position/velocity input from robots |
-| Robot registry, capabilities, status reports | Collision avoidance, conjunction screening |
+| Robot registry, capabilities, physical specifications (thrust, power, forces), status reports | Collision avoidance, conjunction screening |
 | Defining parking orbits (conventional and staging) with a unique slot per robot | Choosing parking orbits / sending idle robots home automatically (phase 2) |
 | Predicted robot and destination position at any time (SGP4) | Accurate maneuver planning (Lambert solving, phasing) |
 | Busy → ready from expected-free time; robot assumed at its destination after arrival | Powered or moving destinations (another robot) |
@@ -165,6 +165,7 @@ ParkingOrbit  1───* ParkingSlot
 Robot         1───* StatusReport
 StatusReport  *───0..1 OrbitalObject    (destination object; object_type PASSIVE)
 StatusReport  *───0..1 ParkingSlot      (destination slot)
+Robot         1───* RobotSpec         (specification history)
 Robot         *───* Capability
 ```
 
@@ -230,6 +231,45 @@ status reports can reference a specific slot by foreign key.
 **`capabilities`** (`id`, `code` unique, `description`), e.g. `GRAPPLE`, `WELD`, `REFUEL`;
 **`robot_capabilities`** (`robot_id`, `capability_id`).
 
+**`robot_specs`**: the robot's physical specifications. Rows are only ever added: a robot
+that is upgraded, repaired or wears down gets a new row with a new `effective_from`, and the
+row in force at time t is the latest one with `effective_from ≤ t`. All values in SI units.
+
+| group | column | type | notes |
+|---|---|---|---|
+| key | id | int PK | |
+| | robot_id | FK robots | |
+| | effective_from | timestamptz | |
+| propulsion | max_thrust_n | float | maximum thrust, newtons |
+| | specific_impulse_s | float | Isp, seconds: how efficiently propellant becomes Δv |
+| | propulsion_type | enum `CHEMICAL`, `ELECTRIC`, `COLD_GAS`, `OTHER` | |
+| mass | dry_mass_kg | float | without propellant; needed to turn thrust into acceleration and Δv |
+| | propellant_capacity_kg | float null | null if the robot uses no consumable propellant |
+| power | power_source | enum `SOLAR`, `BATTERY`, `SOLAR_BATTERY`, `RTG`, `FUEL_CELL`, `OTHER` | RTG = radioisotope generator |
+| | power_output_w | float | continuous electrical power available |
+| | energy_capacity_wh | float null | battery capacity, if any |
+| refuel / recharge | refuel_rate_kg_per_h | float null | propellant transfer rate when docked at a depot |
+| | recharge_rate_w | float null | battery charging rate (Wh gained per hour) |
+| manipulation | max_compression_force_n | float null | gripper / clamp squeeze force, newtons; null if no gripper |
+| | max_arm_force_n | float null | force the arm can apply at its tip, newtons; null if no arm |
+| | source | text | `manufacturer`, `operator`, `test`, … |
+
+`UNIQUE(robot_id, effective_from)`. Checks: all numeric values > 0 when present;
+`refuel_rate_kg_per_h` requires `propellant_capacity_kg`; `recharge_rate_w` requires
+`energy_capacity_wh`.
+
+Thrust and Isp alone do not say how far a robot can go or how fast it can maneuver; that
+needs mass. With them together the system can work out:
+
+| Derived value | Formula | Used for |
+|---|---|---|
+| Acceleration | `max_thrust_n / (dry_mass_kg + propellant_kg)` | burn duration, and whether a quick two-burn transfer is realistic (low-thrust electric robots spiral instead) |
+| Δv capacity when full | `Isp · g₀ · ln((dry + capacity) / dry)` | whether a robot can reach a target at all |
+| Time to refuel / recharge fully | `capacity / rate` | when a robot becomes useful again after a depot visit |
+
+Capabilities (tool codes) say *what* a robot can do; specs say *how much*. Phase 2 jobs can
+require both, e.g. `GRAPPLE` with arm force ≥ 200 N.
+
 **`status_reports`**: status history, rows only ever added.
 
 | column | type | notes |
@@ -282,7 +322,11 @@ astrologistics/
     models.py          SQLAlchemy models (§5.2)
     session.py         engine/session factory from config
     repository.py      latest_elements(object, at), latest_status(robot, at),
-                       last_arrival(robot, at), slot_occupancy(parking, at), add_* helpers
+                       last_arrival(robot, at), slot_occupancy(parking, at),
+                       spec_at(robot, at), add_* helpers
+  robots/
+    specs.py           RobotSpec value type; derived values (acceleration, Δv capacity,
+                       refuel/recharge time)
   ingest/
     tracking.py        TLE file / OMM records → element_sets
     status.py          status report (JSON) → status_reports (incl. slot-free check)
@@ -355,8 +399,15 @@ Cheap screening, enough to rank the nearest robot (A2):
 - Altitude change: Hohmann transfer `Δv` between the two mean radii (circular approximation).
 - Estimate = `Δv_plane + Δv_hohmann` (an upper bound; ignores phasing and combined burns).
 
-Candidates: robots that have the required capabilities, predicted `READY` at the job's
-start time, and no `SGP4_ERROR`, sorted by estimate. Stale data is shown, not hidden.
+Candidates: robots that have the required capabilities, meet the job's minimum specs
+(forces, thrust), are predicted `READY` at the job's start time, and have no `SGP4_ERROR`,
+sorted by estimate.
+
+For low-thrust robots (acceleration well below ~1 mm/s², typical of electric propulsion) a
+two-burn Hohmann transfer is not realistic: the robot spirals slowly instead. The first pass
+then estimates Δv for a slow spiral (Edelbaum's approximation) and the transfer time as
+`Δv / acceleration`, so a robot that is cheap in Δv but takes weeks to arrive ranks
+accordingly. Stale data is shown, not hidden.
 
 The same estimate works between any two orbits, so it also supports parking:
 `cost(robot → parking orbit)` now, versus `cost(parking orbit → expected target)` later.
@@ -375,11 +426,12 @@ parking orbits and free slots automatically is phase 2.
 | Destination object is not `PASSIVE` (a robot or parking orbit object), or unknown | Rejected (parking is addressed by slot) |
 | Destination slot is `OCCUPIED` or `RESERVED` by another robot at the move's `eta`, or its parking orbit is retired | Rejected, with the robot holding it |
 | Parking orbit below 160 km altitude, eccentricity ≥ 1, or slot spacing < `min_slot_spacing_km` | Rejected |
+| Robot spec with missing required values, non-positive numbers, or a rate without its capacity | Rejected |
 | Non-UTC / naive datetimes | Rejected at the edges |
 
 ## 7. Testing strategy
 
-- **Unit**: TLE parsing (checksum, epoch), OMM parsing, parking orbit and slot → elements,
+- **Unit**: robot spec derived values against hand-calculated examples; TLE parsing (checksum, epoch), OMM parsing, parking orbit and slot → elements,
   slot spacing, plane angle for known cases, time conversions.
 - **SGP4 wrapper**: matches the `sgp4` library's own output for known element sets.
 - **Repository**: in-memory SQLite per test; latest-row selection for both streams, last
@@ -400,3 +452,9 @@ parking orbits and free slots automatically is phase 2.
 5. Who decides where conventional parking orbits go, and what makes a good one (e.g. near
    common work areas, low-drag altitude, away from busy orbital shells)? Phase 2 could
    suggest candidates from past job locations.
+6. Should status reports also carry current **propellant** and **battery charge** levels? With
+   the recharge and refuel rates now in the specs, the system could predict charge between
+   reports the same way it predicts position (e.g. charge rises at `recharge_rate_w` while
+   idle, up to capacity), and refuse to assign a robot that lacks the Δv for a job.
+7. Is `max_arm_force_n` alone enough, or do jobs also need arm reach, torque, or
+   payload mass limits?

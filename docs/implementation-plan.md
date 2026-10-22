@@ -23,6 +23,7 @@ SGP4-based prediction of each robot's state at any time. Each milestone ends wit
 | `ElementSet` value type ↔ `Satrec`; parse/validate TLE; read OMM via `sgp4.omm` | `orbit/elementset.py`, `orbit/tle.py` | bad checksum / malformed line rejected; epoch parsed correctly (incl. 2-digit year rollover 57→1957, 56→2056); TLE and OMM of the same object give identical `Satrec` output; OMM with a 6-digit catalog number works |
 | Parking orbit (altitude, i, Ω, e, slot_count, epoch) → `ElementSet`; slot k → `ElementSet`; spacing check | `orbit/parking.py` | mean predicted altitude over 1 day within 2 km of the requested value (instantaneous altitude swings ≈ ±8 km from Earth's oblateness, so don't test single points); inclination matches to < 0.1°; RAAN drifts in the expected direction (westward for prograde orbits); neighbouring slots stay within 1 km of `2π·a/slot_count` apart over 30 days; rejects < 160 km, e ≥ 1, or spacing < 50 km |
 | `propagate(satrec, t) -> OrbitState` | `orbit/propagate.py` | matches `sgp4` library output; error codes passed through as warnings |
+| `RobotSpec` value type; acceleration, Δv capacity, refuel / recharge time | `robots/specs.py` | hand-calculated examples (e.g. 500 kg dry, 100 kg propellant, Isp 300 s → Δv ≈ 536 m/s); missing propellant capacity → Δv capacity `None`; refuel time = capacity / rate |
 | `orbit_normal`, `plane_angle`, `altitude_km`, `inclination_raan(r, v)` | `orbit/elements.py` | plane angle of i=0° vs i=90° is 90°; same orbit → 0; inclination taken from the predicted state matches the TLE's inclination to < 0.1° |
 
 **Done when:** ≥ 95% coverage on these modules; `mypy --strict` passes.
@@ -31,16 +32,17 @@ SGP4-based prediction of each robot's state at any time. Each milestone ends wit
 
 | Task | Detail |
 |---|---|
-| Models | `OrbitalObject`, `ElementSet`, `ParkingOrbit`, `ParkingSlot`, `Robot`, `Capability`, `robot_capabilities`, `StatusReport` as in design §5.2, with the check constraints |
+| Models | `OrbitalObject`, `ElementSet`, `ParkingOrbit`, `ParkingSlot`, `Robot`, `RobotSpec`, `Capability`, `robot_capabilities`, `StatusReport` as in design §5.2, with the check constraints |
 | Session | `make_engine(url)`, `session_scope()`; URL from `ASTROLOG_DB_URL` (default `sqlite:///astrolog.db`) |
 | Migrations | Alembic initial migration |
-| Repository | `add_object`, `add_robot`, `add_elements`, `add_status`, `latest_elements(object, at)`, `latest_status(robot, at)`, `last_arrival(robot, at)`, `slot_occupancy(parking, at)`, `list_robots` |
+| Repository | `add_object`, `add_robot`, `add_elements`, `add_status`, `latest_elements(object, at)`, `latest_status(robot, at)`, `last_arrival(robot, at)`, `slot_occupancy(parking, at)`, `add_spec`, `spec_at(robot, at)`, `list_robots` |
 
 Tests:
 - `latest_elements` / `latest_status` return the newest row with time ≤ `at` and ignore later ones.
 - `last_arrival` finds the most recent report with destination and `eta ≤ at`, even when later reports have no destination.
 - `slot_occupancy` reports each slot FREE / RESERVED / OCCUPIED with the robot holding it: robot en route → RESERVED; arrived → OCCUPIED; later READY report with no destination → still OCCUPIED; later move elsewhere → FREE.
-- Check constraints: both destination object and slot set fails; BUSY without `expected_free_at` fails; READY with destination fails; `PARKING` with a catalog number fails; `ROBOT`/`PASSIVE` without one fails.
+- `spec_at` returns the spec in force at `at`; an upgrade row only applies from its `effective_from`.
+- Check constraints: spec with non-positive values or recharge rate without battery capacity fails; both destination object and slot set fails; BUSY without `expected_free_at` fails; READY with destination fails; `PARKING` with a catalog number fails; `ROBOT`/`PASSIVE` without one fails.
 - Duplicate key: identical re-insert is a no-op; different content raises.
 - `alembic upgrade head` on an empty SQLite file produces the same schema as the models.
 
@@ -89,19 +91,20 @@ Scenario tests (all with `FixedClock`; T = robot element-set epoch):
 
 - `astrolog init-db`
 - `astrolog add-object <catalog> <name> --robot|--passive [--capability …]`
+- `astrolog set-spec <robot> <spec.json>` (adds a new spec row) and `astrolog robots --specs`: thrust, Isp, mass, power source, rates, forces and derived Δv capacity
 - `astrolog add-parking <name> --slots N --alt-km … --inc-deg … --raan-deg … [--purpose conventional|staging] [--ecc …] [--epoch …]`
 - `astrolog parking [<name>] [--at …]`: parking orbits with free / reserved / occupied slots and who holds them
 - `astrolog ingest-elements <file>` (TLE or OMM), `astrolog ingest-status <file|dir>`
 - `astrolog where <robot|--all> [--at ISO8601]`: table of status, altitude, inclination,
   RAAN, elements age, located at / destination, warnings
-- `examples/`: ~8 robots, ~5 passive targets, 2 conventional parking orbits and 1 staging orbit, using real published element sets (robots
+- `examples/`: ~8 robots (with a mix of chemical/electric propulsion, power sources and arm/gripper forces), ~5 passive targets, 2 conventional parking orbits and 1 staging orbit, using real published element sets (robots
   stand in for actual satellites), plus status reports
 - End-to-end test: init → ingest examples → `where --all --at …` output matches a stored expected result
 
 ## Phase 2 (after M5)
 
-1. `orbit/cost.py`: plane change + Hohmann estimate (design §6.2), checked against textbook examples
-2. `jobs` / `job_requirements` tables (job = target object + required capabilities + start time)
+1. `orbit/cost.py`: plane change + Hohmann estimate, and slow-spiral (Edelbaum) estimate with transfer time for low-thrust robots (design §6.2), checked against textbook examples
+2. `jobs` / `job_requirements` tables (job = target object + required capabilities + minimum specs, e.g. arm force, + start time)
 3. `matching/candidates.py`: capability filter → READY at start → cost ranking → `astrolog candidates <job>`
 4. Parking: after a task, suggest the cheapest free slot in a conventional parking orbit; for expected future work, suggest a staging orbit and which robot to send there
 5. Suggest where new conventional parking orbits should go, based on past job locations
