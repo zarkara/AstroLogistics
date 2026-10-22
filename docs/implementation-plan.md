@@ -1,114 +1,105 @@
 # AstroLogistics — Implementation Plan
 
-Builds the testable core described in [design.md](design.md): a database of robots and
-status readings, plus SGP4-based prediction of each robot's state at any time.
-Each milestone ends with a passing test suite and can be merged on its own.
+Builds the testable core described in [design.md](design.md): a database of tracked objects,
+TLE history and robot status reports, plus SGP4-based prediction of each robot's state at any
+time. Each milestone ends with a passing test suite and can be merged on its own.
 
-## Tooling (Milestone 0: project skeleton)
+## Milestone 0: Project skeleton
 
 - `pyproject.toml` (Python ≥ 3.11), package `astrologistics/`
 - Runtime deps: `sgp4>=2.23`, `numpy`, `sqlalchemy>=2.0`, `alembic`
-- Dev deps: `pytest`, `pytest-cov`, `hypothesis`, `ruff`, `mypy`
-- GitHub Actions: ruff → mypy → pytest on 3.11 and 3.13
-- `tests/conftest.py`: `session` fixture (in-memory SQLite, schema created per test),
-  `fixed_clock` fixture, `iss_tle` fixture
+- Dev deps: `pytest`, `pytest-cov`, `ruff`, `mypy`
+- GitHub Actions: ruff → mypy → pytest
+- `tests/conftest.py`: `session` fixture (in-memory SQLite, schema per test), `fixed_clock`
+  fixture, TLE fixtures loaded from `tests/data/`
 
-**Done when:** `pytest` runs (one placeholder test) and CI is green.
+**Done when:** `pytest` runs and CI is green.
 
-## Milestone 1: Orbit math (no database)
+## Milestone 1: Orbit basics (no database)
 
 | Task | Module | Tests |
 |---|---|---|
 | UTC `datetime` ↔ `(jd, fr)`; `Clock` protocol + `SystemClock` / `FixedClock` | `timeutil.py` | round trip to < 1 µs; naive datetimes rejected |
-| `rv_to_coe`, `coe_to_rv`, `orbit_normal`, `plane_angle` | `orbit/elements.py` | round trip on random orbits (hypothesis); plane angle of i=0° vs i=90° is 90°; same orbit gives 0 |
-| `satrec_from_tle`, `satrec_from_elements`, `propagate(satrec, t)`, `propagate_many` | `orbit/propagate.py` | matches `sgp4` reference output for ISS TLE; `SatrecArray` output equals per-robot loop; error codes passed through |
-| `fit_state_vector(r, v, epoch) -> MeanElements` | `orbit/fit.py` | residual < 1 m at epoch for random LEO/MEO; near-circular, near-equatorial, retrograde cases; clear exception when it doesn't converge |
+| Parse/validate TLE → `Satrec` + epoch + parsed elements; OMM via `sgp4.omm` | `orbit/tle.py` | bad checksum / malformed line rejected; epoch parsed correctly (incl. 2-digit year rollover 57→1957, 56→2056); TLE and OMM of the same object give identical `Satrec` output |
+| `propagate(satrec, t) -> OrbitState` | `orbit/propagate.py` | matches `sgp4` library output; error codes passed through as warnings |
+| `orbit_normal`, `plane_angle`, `altitude_km`, `inclination_raan(r, v)` | `orbit/elements.py` | plane angle of i=0° vs i=90° is 90°; same orbit → 0; inclination taken from the predicted state matches the TLE's inclination to < 0.1° |
 
-**Done when:** these modules have ≥ 95% test coverage and `mypy --strict` passes.
+**Done when:** ≥ 95% coverage on these modules; `mypy --strict` passes.
 
 ## Milestone 2: Database
 
 | Task | Detail |
 |---|---|
-| Models | `Robot`, `Capability`, `robot_capabilities`, `StatusReading` exactly as design §4.2, enums `Status`, `DestinationKind`, `ElementSource` |
+| Models | `TrackedObject`, `TleRecord`, `Robot`, `Capability`, `robot_capabilities`, `StatusReport` as in design §5.2, with the check constraints |
 | Session | `make_engine(url)`, `session_scope()`; URL from `ASTROLOG_DB_URL` (default `sqlite:///astrolog.db`) |
-| Migrations | Alembic initial migration generated from the models |
-| Repository | `add_robot`, `get_robot`, `list_robots`, `add_reading`, `latest_reading(robot_id, at)`, `latest_readings(at)` (one query for the whole fleet), `readings_between` |
+| Migrations | Alembic initial migration |
+| Repository | `add_object`, `add_robot`, `add_tle`, `add_status`, `latest_tle(catalog, at)`, `latest_status(robot, at)`, `list_robots` |
 
 Tests:
-- `latest_reading` returns the reading with the greatest `epoch ≤ at`, ignores later ones.
-- `latest_readings` returns one row per robot (check that the query count is 1).
-- Duplicate `(robot_id, epoch)` raises; identical re-insert is a no-op.
-- Migration test: `alembic upgrade head` on an empty SQLite file produces the same schema
-  as `Base.metadata`.
+- `latest_tle` / `latest_status` return the newest row with time ≤ `at` and ignore later ones.
+- Check constraints: BUSY without `expected_free_at` fails; READY with destination fails.
+- Duplicate key: identical re-insert is a no-op; different content raises.
+- `alembic upgrade head` on an empty SQLite file produces the same schema as the models.
 
-**Done when:** the repository tests pass on SQLite, and on PostgreSQL in CI (service
-container), so no SQLite-only behaviour has crept in.
+**Done when:** repository tests pass on SQLite (and on PostgreSQL in CI, using a service container).
 
 ## Milestone 3: Ingestion
 
-`status/ingest.py`: `ingest(session, report: dict, clock) -> StatusReading`
+| Module | Input | Notes |
+|---|---|---|
+| `ingest/tracking.py` | Text file of TLEs (3-line format with name, or 2-line), or OMM JSON | Loads many at once; reports accepted/rejected counts with reasons; unknown catalog numbers rejected |
+| `ingest/status.py` | JSON status report | Example below; enforces that the destination is `PASSIVE` |
 
-- Accepts JSON reports in either form:
-  ```json
-  {"robot": "R-01", "epoch": "2026-10-22T12:00:00Z", "status": "BUSY",
-   "expected_free_at": "2026-10-22T15:00:00Z",
-   "tle": ["1 …", "2 …"],
-   "destination": {"kind": "ORBIT", "inclination_deg": 53.0, "raan_deg": 120.0,
-                   "sma_km": 6928.0, "eta": "2026-10-22T14:30:00Z"}}
-  ```
-  or with `"r_km": […], "v_km_s": […]` instead of `"tle"` (→ `fit_state_vector`).
-- Fills in all the derived columns (state vector, elements, orbit normal) so every stored
-  row is complete.
-- Checks the input (§6 of the design): future epoch, unknown robot, bad status/destination
-  combinations (e.g. `READY` with an `eta`), fit not converging.
+```json
+{"robot": "R-01", "reported_at": "2026-10-22T12:00:00Z", "status": "BUSY",
+ "expected_free_at": "2026-10-23T06:00:00Z",
+ "destination": 48274, "eta": "2026-10-22T20:00:00Z"}
+```
 
-Tests: one test per check; TLE input and vector input of the *same* orbit produce
-positions within 1 km of each other 1 h later.
+Tests: one per rule in design §6.3; loading the same file twice changes nothing.
 
 ## Milestone 4: Prediction
 
-`status/extrapolate.py`: `predict(session, robot_id, at) -> RobotSnapshot` and
-`predict_fleet(session, at) -> list[RobotSnapshot]` (one query + `SatrecArray`).
+`status/predict.py`: `predict(session, robot_id, at) -> RobotSnapshot`, `predict_fleet(session, at)`.
 
-Scenario tests (all with `FixedClock`):
+Scenario tests (all with `FixedClock`; T = robot TLE epoch):
 
 | # | Setup | Expectation |
 |---|---|---|
-| 1 | Reading at t₀ | `predict(t₀)` equals the stored vector (< 1 m); `age == 0`, not stale |
-| 2 | Same | `predict(t₀ + 90 min)` equals direct SGP4 propagation; `age == 90 min` |
-| 3 | Reading at t₀, new reading at t₁ | queries after t₁ use the new reading; queries between t₀ and t₁ still use the old one |
-| 4 | BUSY, `expected_free_at = t₀+2h` | status BUSY at t₀+1h, predicted READY at t₀+3h |
-| 5 | BUSY, destination ORBIT, `eta = t₀+1h` | at t₀+2h: `stale`, reason `MANEUVER_EXPECTED` |
-| 6 | Age > `max_age` | `stale=True`, reason `AGE` |
-| 7 | Reading that decays | `sgp4_error ≠ 0`, NaN position, no exception |
-| 8 | Query before first reading | `NoReading` |
-| 9 | 1 000 robots | `predict_fleet` < 1 s on CI hardware (guards against slow per-robot loops) |
+| 1 | Robot TLE at T, READY status | position at T+6h equals direct SGP4 output; `orbit_basis=OWN_TLE`; no warnings |
+| 2 | Robot TLEs at T and T+1d | queries before T+1d use the first, after use the second |
+| 3 | BUSY, `expected_free_at = T+2h` | BUSY at T+1h; READY (`status_predicted`) at T+3h |
+| 4 | BUSY → destination D, `eta = T+4h`, no newer robot TLE | at T+2h: robot on own TLE, `destination` filled; at T+5h: `orbit_basis=DESTINATION_TLE`, robot position == D's position |
+| 5 | Same as 4, plus robot TLE at T+6h | at T+7h: back to `OWN_TLE` |
+| 6 | TLE 4 days old | `STALE_TLE` warning |
+| 7 | Status 2 days old | `STALE_STATUS` warning |
+| 8 | Decayed / invalid orbit | `SGP4_ERROR`, NaN position, no exception |
+| 9 | No status report | status `UNKNOWN`, orbit still predicted |
+| 10 | No TLE before `at` | `NoOrbitData` |
 
 ## Milestone 5: CLI and sample data
 
-- `astrolog init-db`, `astrolog ingest <file.json|dir>`, `astrolog robots`,
-  `astrolog where <robot|--all> [--at ISO8601]` (table: status, age, stale, altitude,
-  inclination, RAAN, destination)
-- `examples/fleet/`: ~10 robots across LEO shells and planes, generated by a script
-  from public TLEs, so the demo uses realistic orbits
-- End-to-end test: `init-db` → `ingest examples/fleet` → `where --all --at …` output matches a stored expected result
+- `astrolog init-db`
+- `astrolog add-object <catalog> <name> --robot|--passive [--capability …]`
+- `astrolog ingest-tle <file>`, `astrolog ingest-status <file|dir>`
+- `astrolog where <robot|--all> [--at ISO8601]`: table of status, altitude, inclination,
+  RAAN, TLE age, destination, warnings
+- `examples/`: ~8 robots and ~5 passive targets using real published TLEs (robots
+  stand in for actual satellites), plus status reports
+- End-to-end test: init → ingest examples → `where --all --at …` output matches a stored expected result
 
-## Phase 2 (after M5; planned separately)
+## Phase 2 (after M5)
 
-1. `orbit/cost.py`: plane change + Hohmann estimate (design §5.3), checked against
-   textbook examples
-2. `jobs` / `job_requirements` tables; destination `JOB` foreign key
-3. `matching/candidates.py`: capability filter → READY at job start → cost ranking
-4. Greedy multi-job assignment, then evaluate an auction or Hungarian algorithm
-5. Accurate transfer planning (Lambert solver) for the top-N candidates
-6. Frame conversion at the edges (TEME → GCRS/ITRS) via `skyfield`
+1. `orbit/cost.py`: plane change + Hohmann estimate (design §6.2), checked against textbook examples
+2. `jobs` / `job_requirements` tables (job = target object + required capabilities + start time)
+3. `matching/candidates.py`: capability filter → READY at start → cost ranking → `astrolog candidates <job>`
+4. Live tracking feed adapter (depends on open question 1)
+5. Greedy multi-job assignment
 
 ## Risks
 
 | Risk | Mitigation |
 |---|---|
-| Fit unstable for e≈0 / i≈0 orbits | Non-singular element formulation; dedicated tests in M1 |
-| SGP4 accuracy is only ~km/day; not enough for close approach | Fine for screening; design marks stale readings; accurate planning is phase 2 |
-| Maneuvering robots make SGP4 wrong straight away | `MANEUVER_EXPECTED` staleness flag; robots expected to report after each burn |
+| Robot TLEs lag behind maneuvers (tracking networks need several passes after a burn) | Use the destination's TLE after arrival (design §6.1 rule 4); robot appears slightly wrong while in transit, acceptable for ranking |
+| TLE feed outages | Staleness warnings; predictions keep working on old data |
 | SQLite and PostgreSQL behaving differently | Run the repository tests against both in CI from M2 |

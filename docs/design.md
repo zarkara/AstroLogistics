@@ -1,254 +1,269 @@
 # AstroLogistics — Design
 
-Status: draft v0.1 · Language: Python 3.11+ · Propagator: [`sgp4`](https://pypi.org/project/sgp4/) (≥ 2.23)
+Status: draft v0.2 · Language: Python 3.11+ · Propagator: [`sgp4`](https://pypi.org/project/sgp4/) (≥ 2.23)
 
 ## 1. Purpose
 
 Assign work to orbital robots the way land and sea logistics assign work to vehicles, but
-using orbital mechanics instead of road distance. Given a job (a location in orbit plus the
-tools it needs), find available robots that have the tools, rank them by how cheap they are
-to get there, and propose an assignment.
+using orbital mechanics instead of road distance. Given a job (an orbital object to service
+plus the tools needed), find available robots that have the tools, rank them by how cheap
+they are to get there, and propose an assignment.
 
-This first version is about **knowing where every robot is and whether it is free, at any
-moment**, from status readings that arrive irregularly. Ranking and assignment build on that.
+This first version is about **knowing roughly where every robot and target object is, and
+whether each robot is free, at any moment**, from data that arrives irregularly. Ranking and
+assignment build on that.
 
-## 2. Scope
+## 2. Assumptions (decided)
 
-| In scope (v0.1) | Out of scope for now |
+| # | Assumption | Effect on the design |
+|---|---|---|
+| A1 | Orbit data comes from a **tracking network** as TLEs (two-line element sets) | TLE is the only orbit input; no fitting from raw position/velocity vectors |
+| A2 | Predictions only need to be **approximate**: good enough to rank the nearest robot | SGP4's accuracy (≈ 1–3 km/day in low Earth orbit) is enough; generous staleness limits |
+| A3 | The robot network is **sparse** (tens of robots, not thousands) | Simple per-robot loops; no spatial indexing or batch-performance work |
+| A4 | A destination is an **unpowered orbital object** (debris, defunct satellite, depot) tracked by the same network, never another robot | Destinations are catalog objects with their own TLEs; their predicted paths can be trusted because they don't maneuver |
+
+## 3. Scope
+
+| In scope (v0.2) | Out of scope for now |
 |---|---|
-| Robot registry and status readings in a database | Real-time telemetry ingestion protocols |
-| Predicting robot position/velocity at any time from the latest reading (SGP4) | Collision avoidance, conjunction screening |
-| Predicting busy → ready from an expected-free time | Detailed maneuver planning (Lambert solving, phasing) |
-| Quick first-pass cost estimate (plane change + altitude change) | Multi-job optimal assignment (auction or Hungarian algorithm) |
-| Capability (tool) matching | Power, comms, and thermal constraints |
+| Catalog of tracked objects with TLE history | Raw position/velocity input from robots |
+| Robot registry, capabilities, status reports | Collision avoidance, conjunction screening |
+| Predicted robot and target position at any time (SGP4) | Accurate maneuver planning (Lambert solving, phasing) |
+| Busy → ready from expected-free time; robot assumed co-located with its target after arrival | Powered or moving destinations (another robot) |
+| Quick first-pass cost estimate (plane change + altitude change) | Multi-job optimal assignment |
 
-## 3. Key concepts
+## 4. Key concepts
 
-### 3.1 Readings are snapshots; the system predicts between them
+### 4.1 Two independent data streams
 
-A robot reports a **status reading**: its status, orbital state, and destination, valid at
-a specific moment called the *epoch*. Readings are stored and never changed. To answer
-"where is robot X at time t?", the system takes the latest reading with epoch ≤ t and
-propagates it forward with SGP4. When a new reading arrives it replaces the old one as the
-basis for predictions. The old one stays in the table as history.
+Knowing a robot's situation needs two things, and they come from different places at
+different times:
 
-Every predicted value includes its **age** (`t − epoch`). Predictions older than a set
-limit are marked `stale`, so callers can down-rank or ignore them.
+| Stream | Source | Contents | Changes when |
+|---|---|---|---|
+| **Orbit** | Tracking network | TLE per tracked object (robots *and* targets) | New tracking pass, typically every few hours to a day |
+| **Status** | Robot operator / fleet control | READY / BUSY / OFFLINE, expected-free time, destination object, ETA | A job starts, ends, or is re-planned |
 
-### 3.2 Why SGP4, and what that means for the data
+Both are stored as history; rows are only ever added, never changed. The current picture is
+**always derived** by taking the latest row of each stream at or before the query time and
+predicting forward:
 
-SGP4 doesn't propagate a raw position/velocity vector. It propagates **mean orbital
-elements**, the same set a TLE (two-line element set) or OMM (CCSDS Orbit Mean-Elements
-Message) carries. A reading can therefore arrive in one of two forms:
+```
+predict(robot, t) = SGP4(latest TLE for robot's catalog number, t)
+                  + latest status report for robot
+                  + SGP4(latest TLE for destination object, t)   if it has a destination
+```
 
-1. **Element set** (TLE lines or OMM fields). Used directly with `Satrec.twoline2rv` /
-   `sgp4.omm`.
-2. **State vector** (position + velocity at epoch). Converted to SGP4 mean elements at
-   ingestion with an iterative fit (§5.2). The fitted elements are stored alongside the
-   original vector.
+When new data arrives it replaces the old as the basis for predictions; nothing has to be
+recalculated or invalidated.
 
-Either way, each stored reading has both the SGP4 elements (used for prediction) and the
-position/velocity at epoch (used for display and checks).
+### 4.2 TLEs and SGP4
 
-### 3.3 Reference frames, units and time
+A TLE holds mean orbital elements at an epoch: inclination, RAAN, eccentricity, argument
+of perigee, mean anomaly, mean motion, and a drag term (B*). The `sgp4` library turns a
+TLE plus any time into position and velocity:
+`Satrec.twoline2rv(line1, line2).sgp4(jd, fr)`. The tracking network may also deliver the
+same data as OMM (CCSDS Orbit Mean-Elements Message, JSON/XML); `sgp4.omm` reads that into
+the same `Satrec`, so both formats share one path.
+
+### 4.3 Reference frames, units and time
 
 | Item | Convention |
 |---|---|
-| Frame | **TEME** (True Equator Mean Equinox), SGP4's native frame. Everything inside the system uses TEME; conversion to GCRS/ITRS happens only at the edges (future: via `skyfield` or `astropy`). |
+| Frame | **TEME** (True Equator Mean Equinox), SGP4's native frame, used everywhere internally. Robot-to-target comparisons happen in one frame, so no conversion is needed for v0.2. |
 | Distance / velocity | km, km/s |
 | Angles | Radians internally; degrees only in user-facing input/output |
 | Time | Timezone-aware UTC `datetime` at the edges; SGP4 Julian date pairs `(jd, fr)` internally. All database timestamps are UTC. |
-| Earth model | WGS72 (the model SGP4 element sets are defined against) |
+| Earth model | WGS72 (the model TLEs are defined against) |
 
-### 3.4 Orbital plane
+### 4.4 Orbital plane
 
-The "plane" of a robot is described by **inclination `i`** and **right ascension of the
+The "plane" of an orbit is described by **inclination `i`** and **right ascension of the
 ascending node `Ω`**, or equally by the unit orbit normal `ĥ = (r × v)/|r × v|`. The angle
-between two robots' normals is the plane-change angle Δθ, which is usually the largest
-single cost in reaching a target. The plane changes slowly over time because of the
-J2 perturbation (Earth's equatorial bulge), so it is stored at epoch *and* recalculated at
-query time.
+between two normals is the plane-change angle Δθ, usually the largest single cost in reaching a
+target. The plane changes slowly over time (because Earth's equatorial bulge makes RAAN drift),
+so the plane is computed **at query time** from the predicted state rather than stored.
 
-## 4. Data model
+## 5. Data model
 
-### 4.1 Entities
+### 5.1 Entities
 
 ```
-Robot 1───* StatusReading
-Robot *───* Capability          (robot_capabilities)
-Job   *───* Capability          (job_requirements)          [phase 2]
-StatusReading *───0..1 Job      (destination)               [job FK added in phase 2]
+TrackedObject 1───* TleRecord
+TrackedObject 1───0..1 Robot            (a robot is a tracked object we control)
+Robot         1───* StatusReport
+StatusReport  *───0..1 TrackedObject    (destination; must NOT be a robot)
+Robot         *───* Capability
 ```
 
-### 4.2 Tables
+### 5.2 Tables
 
-**`robots`**: registry, rarely changes.
+**`tracked_objects`**: everything the tracking network follows that we care about.
+
+| column | type | notes |
+|---|---|---|
+| catalog_number | int PK | NORAD catalog number from the tracking network |
+| name | text | |
+| object_type | enum `ROBOT`, `PASSIVE` | `PASSIVE` = unpowered (debris, defunct satellite, depot) |
+| created_at | timestamptz | |
+
+**`tle_records`**: orbit history, rows only ever added.
 
 | column | type | notes |
 |---|---|---|
 | id | int PK | |
+| catalog_number | FK tracked_objects | |
+| epoch | timestamptz | parsed from line 1 |
+| line1, line2 | text | stored exactly as received, so it is the source of truth |
+| inclination, raan, eccentricity, mean_motion | float | parsed copies, for filtering and display only |
+| source | text | e.g. `space-track`, `celestrak`, `test` |
+| received_at | timestamptz | |
+
+`UNIQUE(catalog_number, epoch)`; index `(catalog_number, epoch DESC)`.
+
+**`robots`**
+
+| column | type | notes |
+|---|---|---|
+| id | int PK | |
+| catalog_number | FK tracked_objects, unique | object_type must be `ROBOT` |
 | name | text unique | |
-| norad_id | int null | catalog number, if tracked |
-| created_at | timestamptz | |
 
-**`capabilities`**: (`id`, `code` unique, `description`), e.g. `GRAPPLE`, `WELD`, `REFUEL`.
+**`capabilities`** (`id`, `code` unique, `description`), e.g. `GRAPPLE`, `WELD`, `REFUEL`;
+**`robot_capabilities`** (`robot_id`, `capability_id`).
 
-**`robot_capabilities`**: (`robot_id`, `capability_id`) primary key.
+**`status_reports`**: status history, rows only ever added.
 
-**`status_readings`**: append-only; one row per report.
+| column | type | notes |
+|---|---|---|
+| id | int PK | |
+| robot_id | FK robots | |
+| reported_at | timestamptz | when the status is valid |
+| status | enum `READY`, `BUSY`, `OFFLINE` | |
+| expected_free_at | timestamptz null | required when BUSY |
+| destination_catalog_number | FK tracked_objects null | must be a `PASSIVE` object |
+| eta | timestamptz null | expected arrival at destination |
+| source | text | |
+| received_at | timestamptz | |
 
-| group | column | type | notes |
-|---|---|---|---|
-| key | id | int PK | |
-| | robot_id | FK robots | indexed with `epoch` |
-| time | epoch | timestamptz | when the state is valid |
-| | received_at | timestamptz | when we stored it |
-| status | status | enum `READY`, `BUSY`, `OFFLINE` | |
-| | expected_free_at | timestamptz null | when BUSY: predicted time of becoming READY |
-| state vector (TEME) | rx, ry, rz | float | km |
-| | vx, vy, vz | float | km/s |
-| SGP4 mean elements | inclination, raan, eccentricity, arg_perigee, mean_anomaly | float | rad |
-| | mean_motion | float | rad/min (Kozai convention, as `sgp4init` expects) |
-| | bstar, ndot, nddot | float | drag terms; 0 when fitted from a vector |
-| | tle_line1, tle_line2 | text null | original element set, if that was the input |
-| | element_source | enum `TLE`, `OMM`, `FIT` | |
-| plane | normal_x, normal_y, normal_z | float | unit `ĥ` at epoch |
-| destination | destination_kind | enum `NONE`, `JOB`, `ORBIT`, `ROBOT` | |
-| | destination_ref | text null | job id / robot id |
-| | dest_inclination, dest_raan, dest_sma_km | float null | for `ORBIT` destinations |
-| | eta | timestamptz null | expected arrival |
-| | source | text | `telemetry`, `operator`, `test`, … |
+`UNIQUE(robot_id, reported_at)`; index `(robot_id, reported_at DESC)`.
+Checks: `BUSY` ⇒ `expected_free_at` set; destination set ⇒ `eta` set; `READY` ⇒ no destination.
 
-Constraint: `UNIQUE(robot_id, epoch)`. Indexes: `(robot_id, epoch DESC)` for "latest
-reading", and `(status)`.
+The rule "a destination must be passive" is enforced in the ingestion layer (§6.3), because it
+depends on another table's column.
 
-**Why append-only?** Readings never change after they're stored, so history comes for
-free, ingestion can be replayed, and tests can set up a scenario by inserting rows.
-"Current state" is always derived, never stored.
+**Why rows are only ever added:** history comes for free, data loads can be replayed, and
+tests set up a scenario just by inserting rows. "Current state" is never stored.
 
-### 4.3 Database technology
+### 5.3 Database technology
 
-SQLAlchemy 2.0 ORM, with **SQLite** for development and tests (in-memory, no setup) and
-**PostgreSQL** as the production target. Migrations use Alembic. No SQLite-specific SQL, so
-the switch to PostgreSQL is a configuration change.
+SQLAlchemy 2.0 ORM; **SQLite** for development and tests (in-memory, no setup),
+**PostgreSQL** as the production target; Alembic for migrations. No SQLite-specific SQL.
 
-## 5. Components
+## 6. Components
 
 ```
 astrologistics/
-  timeutil.py          UTC ↔ (jd, fr), clock abstraction
+  timeutil.py          UTC ↔ (jd, fr), Clock protocol
   orbit/
-    elements.py        state vector ↔ classical elements, orbit normal, plane angle
-    propagate.py       SGP4 wrapper: Satrec from a stored reading → (r, v) at t; batch via SatrecArray
-    fit.py             state vector → SGP4 mean elements (iterative fit)
-    cost.py            first-pass delta-v estimate                                   [phase 2]
+    tle.py             parse/validate TLE (and OMM) → Satrec + parsed fields
+    elements.py        orbit normal, plane angle, altitude, rv → (i, Ω)
+    propagate.py       SGP4 wrapper: (Satrec, t) → OrbitState
+    cost.py            first-pass delta-v estimate                           [phase 2]
   db/
-    models.py          SQLAlchemy models (§4.2)
+    models.py          SQLAlchemy models (§5.2)
     session.py         engine/session factory from config
-    repository.py      add_robot, add_reading, latest_reading(robot, at), readings_between
+    repository.py      latest_tle(catalog, at), latest_status(robot, at), add_* helpers
+  ingest/
+    tracking.py        TLE file / Space-Track-style feed → tle_records
+    status.py          status report (JSON) → status_reports
   status/
-    ingest.py          check + normalise a raw report → StatusReading
-    extrapolate.py     RobotSnapshot at time t from latest reading
+    predict.py         RobotSnapshot at time t
   matching/
-    candidates.py      capability filter + READY-at-t filter + cost ranking       [phase 2]
-  cli.py               `astrolog robots`, `astrolog where <robot> --at …`, `astrolog ingest file.json`
+    candidates.py      capability filter + READY-at-t + cost ranking         [phase 2]
+  cli.py
 ```
 
-### 5.1 Prediction (`status/extrapolate.py`)
+### 6.1 Prediction (`status/predict.py`)
 
 ```python
 @dataclass(frozen=True)
+class OrbitState:
+    r_km: Vec3; v_km_s: Vec3          # TEME at `at`
+    inclination: float; raan: float   # from the predicted state
+    altitude_km: float
+    tle_epoch: datetime
+    tle_age: timedelta
+    sgp4_error: int                   # 0 = ok
+
+@dataclass(frozen=True)
 class RobotSnapshot:
     robot_id: int
-    at: datetime                      # query time
-    reading_epoch: datetime
-    age: timedelta                    # at - reading_epoch
-    stale: bool                       # age > max_age (config; default 6 h)
-    status: Status                    # predicted (see rules)
-    r_km: Vec3                        # TEME at `at`
-    v_km_s: Vec3
-    normal: Vec3                      # orbit normal at `at`
-    inclination: float
-    raan: float
-    destination: Destination
-    sgp4_error: int                   # 0 = ok; non-zero = SGP4 error code (e.g. decayed)
+    at: datetime
+    status: Status
+    status_predicted: bool            # True if derived (e.g. BUSY→READY), not reported
+    status_age: timedelta
+    orbit: OrbitState                 # where we think the robot is
+    orbit_basis: Literal["OWN_TLE", "DESTINATION_TLE"]
+    destination: OrbitState | None    # where its target is at `at`
+    warnings: frozenset[Warning]      # STALE_TLE, STALE_STATUS, SGP4_ERROR, ...
 ```
 
 Rules for `predict(robot, at)`:
 
-1. Load the latest reading with `epoch ≤ at`. If there is none, raise `NoReading`.
-2. Build the `Satrec` from the stored elements and propagate to `at`. Use `SatrecArray` for
-   fleet-wide queries.
-3. Status:
-   - `BUSY` and `expected_free_at ≤ at` → predicted `READY` (marked as `predicted=True`).
-   - `OFFLINE` stays `OFFLINE`.
-   - Otherwise unchanged.
-4. **Maneuver caveat:** if the robot is BUSY with `destination_kind = ORBIT` and
-   `eta ≤ at`, the robot has presumably moved to its destination orbit, so SGP4 from the
-   old orbit is wrong. v0.1 marks the snapshot `stale=True` with reason `MANEUVER_EXPECTED`
-   rather than guessing a new orbit.
-5. Querying at a time *before* the reading's epoch (propagating backwards) is allowed but
-   flagged; normal use only propagates forwards.
+1. Load the latest status report with `reported_at ≤ at`; none → status `UNKNOWN`.
+2. Load the robot's latest TLE with `epoch ≤ at`; none → raise `NoOrbitData`.
+3. **Status:** `BUSY` and `expected_free_at ≤ at` → `READY` (`status_predicted=True`).
+4. **Position after arrival:** if the robot has a destination, `eta ≤ at`, *and* its own
+   latest TLE is older than `eta`, the robot has maneuvered since that TLE, so its own TLE
+   is no longer valid. Since the target is unpowered and its TLE is reliable, use the
+   **destination's** TLE for the robot's position (`orbit_basis = DESTINATION_TLE`).
+   As soon as the tracking network publishes a robot TLE newer than `eta`, rule 2 takes over again.
+5. **Before arrival** (in transit, `reported_at < at < eta`): the robot's own TLE is used
+   as-is. This is approximate while the robot is maneuvering; acceptable under A2.
+6. **Staleness** (warnings, not errors):
+   `STALE_TLE` if TLE age > `max_tle_age` (default 3 days);
+   `STALE_STATUS` if status age > `max_status_age` (default 24 h).
+7. SGP4 error code (e.g. decayed orbit) → `SGP4_ERROR` warning, position NaN; never raises.
 
-### 5.2 State vector → SGP4 elements (`orbit/fit.py`)
+`predict_fleet(at)` is a simple loop over robots (A3).
 
-1. Convert the reported `(r, v)` to osculating classical elements (actual elements at that
-   instant); use them as the first guess for the mean elements.
-2. Loop: build a `Satrec` with `sgp4init(WGS72, …)` at the reading's epoch, propagate to
-   the epoch, convert the result back to osculating elements, add the difference to the
-   guess (angles wrapped to ±π).
-3. Stop when the position residual < 1 m (typical: ~10 iterations), or fail after 30.
+### 6.2 First-pass cost (`orbit/cost.py`, phase 2)
 
-A prototype matched an ISS state vector to < 1 mm at epoch, and stayed within 1 km of the
-reference TLE after 24 h (the difference is drag, because a fit from a single vector sets
-`bstar = 0`). Near-circular (`e ≈ 0`) and equatorial (`i ≈ 0`) orbits are numerically
-awkward: `fit.py` must handle them by working in non-singular (equinoctial) elements or by
-nudging those values slightly, and this needs dedicated tests.
+Cheap screening, enough to rank the nearest robot (A2):
 
-### 5.3 First-pass cost (`orbit/cost.py`, phase 2)
+- Plane change: `Δv_plane = 2·v·sin(Δθ/2)`, where Δθ is the angle between the robot's
+  and target's orbit normals at the job time.
+- Altitude change: Hohmann transfer `Δv` between the two mean radii (circular approximation).
+- Estimate = `Δv_plane + Δv_hohmann` (an upper bound; ignores phasing and combined burns).
 
-Cheap screening that needs no maneuver planning:
+Candidates: robots that have the required capabilities, predicted `READY` at the job's
+start time, and no `SGP4_ERROR`, sorted by estimate. Stale data is shown, not hidden.
 
-- Plane change: `Δv_plane = 2·v·sin(Δθ/2)` with Δθ = angle between orbit normals.
-- Altitude change: Hohmann transfer `Δv` between the two orbit radii (circular approximation).
-- Estimate = `Δv_plane + Δv_hohmann` (an upper bound; combining burns is cheaper).
-- Phasing (waiting to line up along the orbit) is ignored in the first pass.
-
-Candidates are filtered by capability and by predicted `READY` at the job's start time,
-then sorted by this estimate. Only the top N go on to accurate planning in a later phase.
-
-## 6. Error handling
+### 6.3 Ingestion
 
 | Situation | Behaviour |
 |---|---|
-| SGP4 returns error code (decay, eccentricity out of range, …) | Snapshot returned with `sgp4_error ≠ 0`, position `NaN`; never silently dropped |
-| Reading with epoch in the future (> 60 s clock skew) | Rejected at ingestion |
-| Duplicate `(robot_id, epoch)` | Rejected (same content → no-op, idempotent) |
-| Fit does not converge | Reading rejected with a reason; raw payload logged |
-| Non-UTC / naive datetimes | Rejected at the API edge |
+| Bad TLE (checksum, format, epoch parse) | Rejected with reason |
+| TLE for unknown catalog number | Rejected (objects are registered explicitly) |
+| Duplicate `(catalog_number, epoch)` / `(robot_id, reported_at)` | Same content → no-op; different content → rejected |
+| Status/TLE time more than 60 s in the future | Rejected |
+| Destination is a `ROBOT` object, or unknown | Rejected |
+| Non-UTC / naive datetimes | Rejected at the edges |
 
 ## 7. Testing strategy
 
-- **Unit**: element conversions round-trip; plane angle for known cases; time conversions.
-- **SGP4 wrapper**: matches the reference output of the `sgp4` library itself for known TLEs
-  (the library ships Vallado's verification set).
-- **Fit**: property-based tests (`hypothesis`) over random LEO/MEO orbits, so that the
-  fitted Satrec reproduces the input vector to < 1 m. Separate tests for near-circular,
-  near-equatorial and retrograde orbits.
-- **Repository**: in-memory SQLite per test; latest-reading selection, history ordering,
-  uniqueness.
-- **Prediction**: an injected clock (`Clock` protocol), so tests choose "now". Scenario tests
-  cover a reading at t₀, queries at t₀+Δ, a new reading at t₁ replacing the basis, BUSY → READY
-  after `expected_free_at`, and the maneuver caveat.
-- **No network, no wall-clock** in tests. CI: `ruff`, `mypy --strict`, `pytest` with coverage.
+- **Unit**: TLE parsing (checksum, epoch), plane angle for known cases, time conversions.
+- **SGP4 wrapper**: matches the `sgp4` library's own output for known TLEs.
+- **Repository**: in-memory SQLite per test; latest-row selection for both streams, uniqueness.
+- **Prediction scenarios**: an injected `Clock`, so tests choose "now"; cover each rule in §6.1.
+- **Test data**: fixed TLEs checked into `tests/data/`, so tests never need the network.
+- CI: `ruff`, `mypy --strict`, `pytest` with coverage.
 
 ## 8. Open questions
 
-1. Where do readings come from in practice: robots reporting their own vectors, or
-   tracking-network TLEs? (This affects whether `FIT` or `TLE` is the main path.)
-2. Required prediction accuracy and staleness limit per use case (screening vs. rendezvous).
-3. Should `destination` be able to point to a moving target (another robot) in v0.1, or only
-   to a fixed target orbit?
-4. Multi-job assignment: is greedy acceptable at first, or is global optimisation needed?
-5. Fleet size (tens vs. thousands) decides whether batch propagation and PostGIS-style
-   indexing matter.
+1. Which tracking-network feed, and how is access arranged (Space-Track account, CelesTrak
+   public data, or an internal feed)? Affects only `ingest/tracking.py`.
+2. Where do status reports come from (operator UI, fleet control API, file drop)?
+3. Should destinations also allow a fixed *orbit* (e.g. a parking orbit) with no object in it?
+   Currently not supported.
